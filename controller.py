@@ -27,7 +27,7 @@ from ryu.lib.packet import packet
 from ryu.lib.packet import in_proto as inet
 from ryu.lib.packet import ether_types
 from ryu.lib.packet.ethernet import ethernet
-from ryu.lib.packet.arp import arp
+from ryu.lib.packet.arp import arp, ARP_REQUEST, ARP_REPLY
 from ryu.lib.packet.ipv4 import ipv4
 from ryu.lib.packet.ipv6 import ipv6
 from ryu.lib.packet.lldp import lldp
@@ -35,6 +35,10 @@ from ryu.lib.packet.icmp import icmp
 from ryu.lib.packet.tcp import tcp
 from ryu.lib.packet.udp import udp
 from ryu.lib.dpid import dpid_to_str
+from ryu.controller.ofp_event import EventOFPPacketIn
+from ryu.lib.packet.ether_types import ETH_TYPE_IP, ETH_TYPE_ARP
+
+
 
 from solution.ethernet import HandleEthernet
 
@@ -115,7 +119,7 @@ class Router(RyuApp):
         self.logger.info("🤝\thandshake taken place with datapath: {}".format(dpid_to_str(datapath.id)))
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
+    def packet_in_handler(self, ev: ofp_event.EventOFPPacketIn) -> None:
         """
         Packet In Event Handler
 
@@ -140,6 +144,12 @@ class Router(RyuApp):
         parser = datapath.ofproto_parser
         pkt = packet.Packet(ev.msg.data)
         in_port = ev.msg.match["in_port"]
+
+        if self.__illegal_packet(pkt):
+            return
+
+        self.logger.info("❗️\tevent 'packet in' from datapath: {}".format(dpid_to_str(datapath.id)))
+
         eth_pkt: ethernet = pkt.get_protocol(ethernet)
         ip_pkt: ipv4 = pkt.get_protocol(ipv4)
         arp_pkt: arp = pkt.get_protocol(arp)
@@ -150,10 +160,28 @@ class Router(RyuApp):
         self.logger.info("----- Packet Information Start -----")
         if eth_pkt:
             self.logger.info(f"Ethernet: src={eth_pkt.src}, dst={eth_pkt.dst}, ethertype={eth_pkt.ethertype}")
+            # if eth_pkt.dst == 'ff:ff:ff:ff:ff:ff':
+            #     # Handle broadcast packet
+            #     self.forward_broadcast(datapath, in_port, ev.msg.data)
+            #     return
+
+            # # dpid identifies the switch/router
+            # output_port = self.determine_output_port(dpid, eth_pkt.dst)
+            # if output_port is None:
+            #     self.logger.error("🚨\tno output port found")
+            #     return
+            # self.logger.info(f"Output Port: {output_port}")
+            # actions = [parser.OFPActionOutput(output_port)]
+            # out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+            #                           in_port=in_port, actions=actions, data=ev.msg.data)
+            # datapath.send_msg(out)
+
         if ip_pkt:
             self.logger.info(f"IPv4: src={ip_pkt.src}, dst={ip_pkt.dst}, proto={ip_pkt.proto}")
         if arp_pkt:
             self.logger.info(f"ARP: src_ip={arp_pkt.src_ip}, dst_ip={arp_pkt.dst_ip}, src_mac={arp_pkt.src_mac}, dst_mac={arp_pkt.dst_mac}")
+            self.handle_arp(datapath, in_port, eth_pkt, arp_pkt)
+
         if tcp_pkt:
             self.logger.info(f"TCP: src_port={tcp_pkt.src_port}, dst_port={tcp_pkt.dst_port}, seq={tcp_pkt.seq}, ack={tcp_pkt.ack}")
         if udp_pkt:
@@ -162,12 +190,94 @@ class Router(RyuApp):
             self.logger.info(f"ICMP: type={icmp_pkt.type}, code={icmp_pkt.code}")
         self.logger.info("----- Packet Information End -----")
 
-        if self.__illegal_packet(pkt):
-            return
-
-        self.logger.info("❗️\tevent 'packet in' from datapath: {}".format(dpid_to_str(datapath.id)))
-
         return
+    def handle_arp(self, datapath, in_port, pkt_ethernet: ethernet, pkt_arp: arp):
+        """
+        Handle ARP packets
+        We need to find the entry in the interfaces.json that matches the in_port.
+        """
+        # Check if it's an ARP request
+        if pkt_arp.opcode != ARP_REQUEST:
+            return  # Only handle ARP requests
+
+        dpid = dpid_to_str(datapath.id)
+        interface = self.interface_table.get_interface(dpid, in_port)
+        if interface:
+            self.logger.info(f"Interface ARP Reply: {interface['hw']}")
+        else:
+            self.logger.error("🚨\tno interface found for in_port: {}".format(in_port))
+        
+        hw = interface["hw"]
+        self.logger.info(f"Interface ARP Reply: {hw}")
+        self.send_arp_reply(datapath, in_port, pkt_ethernet, pkt_arp, interface)
+
+    def send_arp_reply(self, datapath, in_port, pkt_ethernet: ethernet, pkt_arp: arp, interface):
+        """
+        Send an ARP reply in response to an ARP request for one of the router's interfaces.
+        We are implementing ARP Proxying. H1 pings H2, they are in different subnets. 
+        The router has an ARP table and doesn't have to flood the network, so it pretends to be H2
+        and gives its own interface MAC address, pretending it's H2 (pkt_arp.dst_ip as the src_ip). 
+        """
+        src_mac = interface['hw']  # MAC address of the router's interface
+        src_ip = interface['ip']  # IP address of the router's interface
+
+        # Construct ARP reply packet
+        e = ethernet(dst=pkt_ethernet.src,
+                            src=src_mac,
+                            ethertype=ETH_TYPE_ARP)
+        a = arp(opcode=ARP_REPLY,
+                    src_mac=src_mac,
+                    src_ip=pkt_arp.dst_ip,
+                    dst_mac=pkt_arp.src_mac,
+                    dst_ip=pkt_arp.src_ip)
+
+        # Create the packet
+        p = packet.Packet()
+        p.add_protocol(e)
+        p.add_protocol(a)
+        p.serialize()
+
+        # Send the ARP reply packet
+        actions = [datapath.ofproto_parser.OFPActionOutput(port=in_port)]
+        out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath,
+                                                buffer_id=datapath.ofproto.OFP_NO_BUFFER,
+                                                in_port=datapath.ofproto.OFPP_CONTROLLER,
+                                                actions=actions,
+                                                data=p.data)
+        datapath.send_msg(out)
+        self.logger.info(f"Sent ARP Reply: {src_ip} is at {src_mac}")
+
+
+    # def forward_broadcast(self, datapath, in_port, data):
+    #     ofproto = datapath.ofproto
+    #     parser = datapath.ofproto_parser
+
+    #     # Get all ports for this datapath (switch)
+    #     ports = self.get_datapath_ports(datapath.id)
+
+    #     actions = [parser.OFPActionOutput(port) for port in ports if port != in_port]
+
+    #     out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+    #                             in_port=in_port, actions=actions, data=data)
+    #     datapath.send_msg(out)
+
+    # def get_datapath_ports(self, dpid):
+    #     # Placeholder for getting all ports of a datapath (switch)
+    #     # You might maintain a structure that tracks this information
+    #     # based on port status messages from the switch
+    #     return [1, 2, 3]  # Example: return a list of port numbers
+
+    # def determine_output_port(self, dpid, dst_mac):
+    #     current_switch_table = self.interface_table.get_table_for_dpid(dpid)
+    #     # this is a list of the dic in the interfaces.json
+    #     # we have to filter out by hw (MAC) and then get the port
+
+    #     self.logger.info("dst_mac: {}".format(dst_mac))
+    #     for entry in current_switch_table:
+    #         self.logger.info(f"entry: {entry}")
+    #         if entry["hw"] == dst_mac:
+    #             return entry["port"]
+    #     return None
 
     # SUPPORT FUNCTIONS
     # -----------------
