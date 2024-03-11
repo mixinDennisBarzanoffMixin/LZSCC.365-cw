@@ -208,7 +208,6 @@ class Router(RyuApp):
             self.logger.error("🚨\tno interface found for in_port: {}".format(in_port))
         
         hw = interface["hw"]
-        self.logger.info(f"Interface ARP Reply: {hw}")
         self.send_arp_reply(datapath, in_port, pkt_ethernet, pkt_arp, interface)
 
     def send_arp_reply(self, datapath, in_port, pkt_ethernet: ethernet, pkt_arp: arp, interface):
@@ -245,7 +244,7 @@ class Router(RyuApp):
                                                 actions=actions,
                                                 data=p.data)
         datapath.send_msg(out)
-        self.logger.info(f"Sent ARP Reply: {src_ip} is at {src_mac}")
+        self.logger.info(f"Sent ARP Reply: {pkt_arp.dst_ip} is at {src_mac}, which is actually {src_ip}, but we proxy direclty and lie it's our interface that's the host")
 
 
     # def forward_broadcast(self, datapath, in_port, data):
