@@ -1,0 +1,78 @@
+{
+  "0000000000000002": [
+    {
+      "id": 1,
+      "description": "allow icmp traffic via this device",
+      "allow": true,
+      "priority": 100,
+      "match": {
+        "ip_proto": "0x01"
+      }
+    },
+    {
+      "id": 2,
+      "description": "block http to the web server on h4",
+      "allow": false,
+      "priority": 99,
+      "match": {
+        "ip_dst": "112.97.37.201",
+        "tcp_dst": 80
+      }
+    },
+    {
+      "id": 3,
+      "description": "allow http",
+      "allow": true,
+      "priority": 98,
+      "match": {
+        "tcp_dst": 80
+      }
+    },
+    {
+      "id": 4,
+      "description": "block http to the web server on h3",
+      "allow": false,
+      "priority": 98,
+      "match": {
+        "ip_dst": "112.97.37.9",
+        "tcp_dst": 80
+      }
+    },
+    {
+      "id": 5,
+      "description": "allow other traffic",
+      "allow": true,
+      "priority": 2,
+      "match": {}
+    }
+  ],
+  "0000000000000003": [
+    {
+      "id": 1,
+      "description": "allow icmp traffic via this device",
+      "allow": true,
+      "priority": 100,
+      "match": {
+        "ip_proto": "0x01"
+      }
+    },
+    {
+      "id": 2,
+      "description": "block udp traffic where the dst port is 53",
+      "allow": false,
+      "priority": 50,
+      "match": {
+        "udp_dst": 53
+      }
+    },
+    {
+      "id": 3,
+      "description": "allow ip traffic",
+      "allow": true,
+      "priority": 3,
+      "match": {
+        "eth_type": "0x0800"
+      }
+    }
+  ]
+}

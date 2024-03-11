@@ -1,0 +1,51 @@
+{
+    "0000000000000002": [
+        {
+            "destination": "10.0.0.140/32",
+            "out_port": 1,
+            "hop": null
+        },
+        {
+            "destination": "10.0.0.69/32",
+            "out_port": 2,
+            "hop": null
+        },
+        {
+            "destination": "88.42.191.0/24",
+            "out_port": 3,
+            "hop": null
+        },
+        {
+            "destination": "112.97.37.0/24",
+            "out_port": 3,
+            "hop": "88.42.191.2"
+        },
+        {
+            "destination": "1.2.3.0/24",
+            "out_port": 3,
+            "hop": "88.42.191.2"
+        }
+    ],
+    "0000000000000003": [
+        {
+            "destination": "10.0.0.0/24",
+            "out_port": 2,
+            "hop": "88.42.191.1"
+        },
+        {
+            "destination": "88.42.191.0/24",
+            "out_port": 2,
+            "hop": null
+        },
+        {
+            "destination": "112.97.37.0/24",
+            "out_port": 1,
+            "hop": null
+        },
+        {
+            "destination": "1.2.3.0/24",
+            "out_port": 3,
+            "hop": null
+        }
+    ]
+}
