@@ -13,6 +13,7 @@ Note: Requires Python3.8 or higher (uses the ':=' operator)
 """
 
 from typing import Optional, Tuple, Union
+from netaddr import IPAddress, IPNetwork
 
 from ryu.base.app_manager import RyuApp
 from ryu.controller import ofp_event
@@ -176,11 +177,15 @@ class Router(RyuApp):
             #                           in_port=in_port, actions=actions, data=ev.msg.data)
             # datapath.send_msg(out)
 
-        if ip_pkt:
-            self.logger.info(f"IPv4: src={ip_pkt.src}, dst={ip_pkt.dst}, proto={ip_pkt.proto}")
+            # we need to forward this packet
         if arp_pkt:
             self.logger.info(f"ARP: src_ip={arp_pkt.src_ip}, dst_ip={arp_pkt.dst_ip}, src_mac={arp_pkt.src_mac}, dst_mac={arp_pkt.dst_mac}")
             self.handle_arp(datapath, in_port, eth_pkt, arp_pkt)
+            return
+        if ip_pkt:
+            self.logger.info(f"IPv4: src={ip_pkt.src}, dst={ip_pkt.dst}, proto={ip_pkt.proto}")
+            self.forward_packet(datapath, in_port, pkt, ev)
+            return
 
         if tcp_pkt:
             self.logger.info(f"TCP: src_port={tcp_pkt.src_port}, dst_port={tcp_pkt.dst_port}, seq={tcp_pkt.seq}, ack={tcp_pkt.ack}")
@@ -191,6 +196,75 @@ class Router(RyuApp):
         self.logger.info("----- Packet Information End -----")
 
         return
+
+    # the full packet is passed to this function, so we can get the other layers, not just ethernet and ip
+    def forward_packet(self, datapath, in_port, pkt: packet.Packet, ev: ofp_event.EventOFPPacketIn):
+        """
+        Forward the packet to the next hop
+        """
+        pkt_ipv4: ipv4 = pkt.get_protocol(ipv4)
+        if not pkt_ipv4:
+            self.logger.error("🚨\tno ipv4 packet found")
+            return
+        pkt_ethernet: ethernet = pkt.get_protocol(ethernet)
+        if not pkt_ethernet:
+            self.logger.error("🚨\tno ethernet packet found")
+            return
+        # find the entry from the routing table
+        routing_table = self.routing_table.get_table_for_dpid(dpid_to_str(datapath.id))
+        self.logger.info(f"Routing Table: {routing_table}")
+        dst_ip = pkt_ipv4.dst
+        output_port = None
+        for entry in routing_table:
+            self.logger.info(f"Routing Table Entry: {entry}")
+            if IPAddress(dst_ip) in IPNetwork(entry['destination']):
+                output_port = entry['out_port']
+                self.logger.info(f"✅ Output Port: {output_port}")
+                break;
+
+        if not output_port:
+            self.logger.error("🚨\tno output port found")
+            return
+
+        actions = [datapath.ofproto_parser.OFPActionOutput(output_port)]
+
+        # mac address changes, otherwise next host won't care about it
+        # for src_mac, we need to find the mac address on the same interfacea as this IPNetwork
+        src_mac = None
+        dst_mac = None
+        for interface_entry in self.interface_table.get_table_for_dpid(dpid_to_str(datapath.id)):
+            if interface_entry['port'] == output_port:
+                src_mac = interface_entry['hw']
+                break
+        for arp_entry in self.arp_table.get_table_for_dpid(dpid_to_str(datapath.id)):
+            if arp_entry['ip'] == dst_ip:
+                dst_mac = arp_entry['hw']
+                break
+        if not dst_mac:
+            self.logger.error("🚨\tno dst mac address found for ip: {}".format(IPAddress(dst_ip)))
+            return
+        if not src_mac:
+            self.logger.error("🚨\tno src mac address found for source interface: {}".format(entry['destination']))
+            return
+    
+        e = ethernet(dst=dst_mac, src=src_mac, ethertype=pkt_ethernet.ethertype)
+        p = packet.Packet()
+        p.add_protocol(e)
+        # there was a problem where the packets TX transmitted were bigger than RX received
+        # I was forgetting to add the other layers, it was confusing as h2 was receiving h1's pings, but not replying
+        # and they were like 50% smaller packets, so I figured it was a good idea to add the other layers lol
+        protocols = pkt.protocols
+        self.logger.info(protocols)
+        for protocol in protocols[1:]:
+            p.add_protocol(protocol)
+        p.serialize()
+        self.logger.info(f"✅ Output Ethernet Frame Source MAC: {src_mac}, Destination MAC: {dst_mac}")
+        self.logger.info(f"✅ Output IP Frame Source IP: {pkt_ipv4.src}, Destination IP: {pkt_ipv4.dst}")
+        out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
+                                                    in_port=in_port, actions=actions, data=p.data)
+        datapath.send_msg(out)
+        return
+
     def handle_arp(self, datapath, in_port, pkt_ethernet: ethernet, pkt_arp: arp):
         """
         Handle ARP packets
