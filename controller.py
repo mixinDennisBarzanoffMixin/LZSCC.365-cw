@@ -247,7 +247,7 @@ class Router(RyuApp):
             self.logger.error("🚨\tno dst mac address found for ip: {}".format(IPAddress(dst_ip)))
             return
         if not src_mac:
-            self.logger.error("🚨\tno src mac address found for source interface: {}".format(entry['destination']))
+            self.logger.error("🚨\tno src mac address found for source interface: {}".format(routing_entry['destination']))
             return
     
         e = ethernet(dst=dst_mac, src=src_mac, ethertype=pkt_ethernet.ethertype)
