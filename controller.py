@@ -39,8 +39,8 @@ from ryu.lib.dpid import dpid_to_str
 from ryu.controller.ofp_event import EventOFPPacketIn
 from ryu.lib.packet.ether_types import ETH_TYPE_IP, ETH_TYPE_ARP
 from ryu.lib.packet.in_proto import IPPROTO_ICMP
-from ryu.lib.packet.icmp import ICMP_ECHO_REQUEST, ICMP_ECHO_REPLY
-
+from ryu.lib.packet.icmp import ICMP_DEST_UNREACH, ICMP_TIME_EXCEEDED, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, ICMP_PORT_UNREACH_CODE, ICMP_TTL_EXPIRED_CODE, ICMP_HOST_UNREACH_CODE
+from ryu.lib.packet.icmp import echo, dest_unreach, TimeExceeded
 
 
 
@@ -57,6 +57,20 @@ class ICMPError(Exception):
     def __init__(self, message="ICMP Error occurred"):
         self.message = message
         super().__init__(self.message)
+
+
+class UnknownICMPError(ICMPError):
+    """
+    Extended ICMP Error for specific ICMP related issues, including unknown subnets.
+    """
+    def __init__(self, message="Extended ICMP Error occurred", subnet=None):
+        super().__init__(message)
+        self.subnet = subnet
+
+    def __str__(self):
+        if self.subnet:
+            return f"{self.message} Subnet: {self.subnet}"
+        return self.message
 
 
 
@@ -187,7 +201,11 @@ class Router(RyuApp):
                         return
         if ip_pkt:
             self.logger.info(f"IPv4: src={ip_pkt.src}, dst={ip_pkt.dst}, proto={ip_pkt.proto}")
-            self.forward_packet(datapath, in_port, pkt, ev)
+            try:
+                self.forward_packet(datapath, in_port, pkt, ev)
+            except UnknownICMPError as e:
+                self.logger.error(f"Failed to forward packet: {e}")
+                self.send_icmp_unknown_subnet_error(datapath, in_port, pkt, ev)
             return
 
         if tcp_pkt:
@@ -197,8 +215,47 @@ class Router(RyuApp):
         self.logger.info("----- Packet Information End -----")
 
         return
+    def send_icmp_unknown_subnet_error(self, datapath, in_port, pkt, ev):
+        """
+        Generate and send an ICMP error message for packets destined to unknown subnets.
+        """
+        pkt_ipv4 = pkt.get_protocol(ipv4)
+        # first figure out which subnet the src ip is in, then we find which interface is in that subnet
+        for subnet in self.routing_table.get_table_for_dpid(dpid_to_str(datapath.id)):
+            if IPAddress(pkt_ipv4.src) in IPNetwork(subnet['destination']):
+                out_port = subnet['out_port']
+                break
+        
+        if out_port is None:
+            self.logger.error("🚨\tNo output port found for interface during ICMP error message handling")
+            return
+        for eth_entry in self.interface_table.get_table_for_dpid(dpid_to_str(datapath.id)):
+            if eth_entry['port'] == out_port:
+                src_ip = eth_entry['ip']
+                break
+        if src_ip is None:
+            self.logger.error("🚨\tNo source IP found for interface during ICMP error message handling")
+            return
+        # we need to send an ICMP error message to the src ip and mac address
+        self.logger.info("🚨 Generating ICMP error message for unknown subnet")
+        eth_header_length = 14  # Ethernet header length
+        original_ip_icmp_data = pkt.data[eth_header_length:eth_header_length+28]  # Skip Ethernet header, then IP header (20 bytes) + first 8 bytes of payload
+
+        original_pkt_data = dest_unreach(data=original_ip_icmp_data)
+        
+        self.send_icmp_reply_general(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH, ICMP_HOST_UNREACH_CODE, src_ip, original_pkt_data)
+    
 
     def send_icmp_reply(self, datapath, in_port, pkt, ev):
+        """
+        Generate and send an ICMP reply for an ICMP request.
+        """
+        pkt_ipv4 = pkt.get_protocol(ipv4)
+        # precondition is they sent to us, so dst is our address
+        src_ip = pkt_ipv4.dst
+        self.send_icmp_reply_general(datapath, in_port, pkt, ev, ICMP_ECHO_REPLY, 0, src_ip, pkt.get_protocol(icmp).data)
+
+    def send_icmp_reply_general(self, datapath, in_port, pkt, ev, icmp_type, icmp_code, src_ip, icmp_data):
         """
         Generate and send an ICMP reply for an ICMP request.
         """
@@ -216,8 +273,11 @@ class Router(RyuApp):
         # to send an ICMP reply, we need to reply to the src ip and mac address
         src_mac = pkt_ethernet.dst
         dst_mac = pkt_ethernet.src
-        src_ip = pkt_ipv4.dst
         dst_ip = pkt_ipv4.src
+        # pkt_ipv4 might not always be right, we need to get the ip address for the interface
+        # by default to who sent it
+        if src_ip is None:
+            src_ip = pkt_ipv4.dst
 
         self.logger.info(f"Sending ICMP reply to {dst_ip}")
 
@@ -225,8 +285,7 @@ class Router(RyuApp):
         actions = [parser.OFPActionOutput(in_port)]
         out_pkt_ethernet = ethernet(dst=dst_mac, src=src_mac, ethertype=ETH_TYPE_IP)
         out_pkt_ip = ipv4(dst=dst_ip, src=src_ip, proto=IPPROTO_ICMP)
-        print(pkt_icmp.data)
-        out_pkt_icmp = icmp(type_=ICMP_ECHO_REPLY, code=0, csum=0, data=pkt_icmp.data)
+        out_pkt_icmp = icmp(type_=icmp_type, code=icmp_code, csum=0, data=icmp_data)
         out_pkt = packet.Packet()
         out_pkt.add_protocol(out_pkt_ethernet)
         out_pkt.add_protocol(out_pkt_ip)
@@ -267,6 +326,7 @@ class Router(RyuApp):
 
         if not output_port:
             self.logger.error("🚨\tno output port found")
+            raise UnknownICMPError(f"Subnet unknown for ip: {IPAddress(dst_ip)}", subnet=routing_entry['destination'])
             return
 
         actions = [datapath.ofproto_parser.OFPActionOutput(output_port)]
@@ -288,6 +348,7 @@ class Router(RyuApp):
                 break
         if not dst_mac:
             self.logger.error("🚨\tno dst mac address found for ip: {}".format(IPAddress(dst_ip)))
+            raise UnknownICMPError(f"No ARP entry for ip: {IPAddress(dst_ip)}", subnet=routing_entry['destination'])
             return
         if not src_mac:
             self.logger.error("🚨\tno src mac address found for source interface: {}".format(routing_entry['destination']))
