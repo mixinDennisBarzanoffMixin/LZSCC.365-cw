@@ -215,10 +215,10 @@ class Router(RyuApp):
         self.logger.info(f"Routing Table: {routing_table}")
         dst_ip = pkt_ipv4.dst
         output_port = None
-        for entry in routing_table:
-            self.logger.info(f"Routing Table Entry: {entry}")
-            if IPAddress(dst_ip) in IPNetwork(entry['destination']):
-                output_port = entry['out_port']
+        for routing_entry in routing_table:
+            self.logger.info(f"Routing Table Entry: {routing_entry}")
+            if IPAddress(dst_ip) in IPNetwork(routing_entry['destination']):
+                output_port = routing_entry['out_port']
                 self.logger.info(f"✅ Output Port: {output_port}")
                 break;
 
@@ -236,6 +236,9 @@ class Router(RyuApp):
             if interface_entry['port'] == output_port:
                 src_mac = interface_entry['hw']
                 break
+        # now, dst_ip is not always accurate here, what if it's another router, we need to use next hop ip
+        if routing_entry['hop']:
+            dst_ip = routing_entry['hop']
         for arp_entry in self.arp_table.get_table_for_dpid(dpid_to_str(datapath.id)):
             if arp_entry['ip'] == dst_ip:
                 dst_mac = arp_entry['hw']
