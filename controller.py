@@ -38,6 +38,9 @@ from ryu.lib.packet.udp import udp
 from ryu.lib.dpid import dpid_to_str
 from ryu.controller.ofp_event import EventOFPPacketIn
 from ryu.lib.packet.ether_types import ETH_TYPE_IP, ETH_TYPE_ARP
+from ryu.lib.packet.in_proto import IPPROTO_ICMP
+from ryu.lib.packet.icmp import ICMP_ECHO_REQUEST, ICMP_ECHO_REPLY
+
 
 
 
@@ -46,6 +49,15 @@ from solution.ethernet import HandleEthernet
 import json
 import sys
 import ipaddress
+
+class ICMPError(Exception):
+    """
+    Exception class for ICMP related errors.
+    """
+    def __init__(self, message="ICMP Error occurred"):
+        self.message = message
+        super().__init__(self.message)
+
 
 
 class Router(RyuApp):
@@ -161,27 +173,18 @@ class Router(RyuApp):
         self.logger.info("----- Packet Information Start -----")
         if eth_pkt:
             self.logger.info(f"Ethernet: src={eth_pkt.src}, dst={eth_pkt.dst}, ethertype={eth_pkt.ethertype}")
-            # if eth_pkt.dst == 'ff:ff:ff:ff:ff:ff':
-            #     # Handle broadcast packet
-            #     self.forward_broadcast(datapath, in_port, ev.msg.data)
-            #     return
-
-            # # dpid identifies the switch/router
-            # output_port = self.determine_output_port(dpid, eth_pkt.dst)
-            # if output_port is None:
-            #     self.logger.error("🚨\tno output port found")
-            #     return
-            # self.logger.info(f"Output Port: {output_port}")
-            # actions = [parser.OFPActionOutput(output_port)]
-            # out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
-            #                           in_port=in_port, actions=actions, data=ev.msg.data)
-            # datapath.send_msg(out)
-
-            # we need to forward this packet
         if arp_pkt:
             self.logger.info(f"ARP: src_ip={arp_pkt.src_ip}, dst_ip={arp_pkt.dst_ip}, src_mac={arp_pkt.src_mac}, dst_mac={arp_pkt.dst_mac}")
             self.handle_arp(datapath, in_port, eth_pkt, arp_pkt)
             return
+       # we check if ECHO and is for one of our ips, we respond
+        if icmp_pkt:
+            self.logger.info(f"ICMP: type={icmp_pkt.type}, code={icmp_pkt.code}")
+            if icmp_pkt.type == ICMP_ECHO_REQUEST:
+                for interface in self.interface_table.get_table_for_dpid(dpid_to_str(datapath.id)):
+                     if interface['ip'] == ip_pkt.dst:
+                        self.send_icmp_reply(datapath, in_port, pkt, ev)
+                        return
         if ip_pkt:
             self.logger.info(f"IPv4: src={ip_pkt.src}, dst={ip_pkt.dst}, proto={ip_pkt.proto}")
             self.forward_packet(datapath, in_port, pkt, ev)
@@ -191,10 +194,50 @@ class Router(RyuApp):
             self.logger.info(f"TCP: src_port={tcp_pkt.src_port}, dst_port={tcp_pkt.dst_port}, seq={tcp_pkt.seq}, ack={tcp_pkt.ack}")
         if udp_pkt:
             self.logger.info(f"UDP: src_port={udp_pkt.src_port}, dst_port={udp_pkt.dst_port}")
-        if icmp_pkt:
-            self.logger.info(f"ICMP: type={icmp_pkt.type}, code={icmp_pkt.code}")
         self.logger.info("----- Packet Information End -----")
 
+        return
+
+    def send_icmp_reply(self, datapath, in_port, pkt, ev):
+        """
+        Generate and send an ICMP reply for an ICMP request.
+        """
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        pkt_ethernet: ethernet = pkt.get_protocol(ethernet)
+        pkt_ipv4: ipv4 = pkt.get_protocol(ipv4)
+        pkt_icmp: icmp = pkt.get_protocol(icmp)
+
+        if not pkt_ethernet or not pkt_ipv4 or not pkt_icmp:
+            self.logger.error("🚨\tMissing protocol layer for ICMP reply")
+            return
+
+        # to send an ICMP reply, we need to reply to the src ip and mac address
+        src_mac = pkt_ethernet.dst
+        dst_mac = pkt_ethernet.src
+        src_ip = pkt_ipv4.dst
+        dst_ip = pkt_ipv4.src
+
+        self.logger.info(f"Sending ICMP reply to {dst_ip}")
+
+        # create new packet out message
+        actions = [parser.OFPActionOutput(in_port)]
+        out_pkt_ethernet = ethernet(dst=dst_mac, src=src_mac, ethertype=ETH_TYPE_IP)
+        out_pkt_ip = ipv4(dst=dst_ip, src=src_ip, proto=IPPROTO_ICMP)
+        print(pkt_icmp.data)
+        out_pkt_icmp = icmp(type_=ICMP_ECHO_REPLY, code=0, csum=0, data=pkt_icmp.data)
+        out_pkt = packet.Packet()
+        out_pkt.add_protocol(out_pkt_ethernet)
+        out_pkt.add_protocol(out_pkt_ip)
+        out_pkt.add_protocol(out_pkt_icmp)
+        out_pkt.serialize()
+
+        self.logger.info(f"✅ Sending ICMP reply from {src_ip} to {dst_ip}, MAC from {src_mac} to {dst_mac}")
+        # using OFPP_ANY or OFPP_CONTROLLER as the output port in order to bypass OpenFlow switch rules, just send it directly
+        # otherwise the switch does not want to send it
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER, in_port=ofproto.OFPP_CONTROLLER, actions=actions, data=out_pkt.data);
+        datapath.send_msg(out)
         return
 
     # the full packet is passed to this function, so we can get the other layers, not just ethernet and ip
