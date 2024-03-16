@@ -73,6 +73,15 @@
       "match": {
         "eth_type": "0x0800"
       }
+    },
+    {
+      "id": 4,
+      "description": "allow arp traffic (added by me to show off my ARP proxying)",
+      "allow": true,
+      "priority": 2,
+      "match": {
+        "eth_type": "0x0806"
+      }
     }
   ]
 }
