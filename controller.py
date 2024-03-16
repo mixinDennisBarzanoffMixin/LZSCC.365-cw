@@ -44,10 +44,8 @@ from ryu.lib.packet.ether_types import ETH_TYPE_IP, ETH_TYPE_ARP
 from ryu.lib.packet.in_proto import IPPROTO_ICMP
 from ryu.lib.packet.icmp import ICMP_DEST_UNREACH, ICMP_TIME_EXCEEDED, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, ICMP_PORT_UNREACH_CODE, ICMP_TTL_EXPIRED_CODE, ICMP_HOST_UNREACH_CODE
 from ryu.lib.packet.icmp import echo, dest_unreach, TimeExceeded
+from ryu.ofproto import ofproto_v1_3_parser
 
-
-
-from solution.ethernet import HandleEthernet
 
 import json
 import sys
@@ -181,8 +179,9 @@ class Router(RyuApp):
         dpid = dpid_to_str(datapath.id)
         self.__request_port_info(datapath)
         actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_CONTROLLER, datapath.ofproto.OFPCML_NO_BUFFER)]
+        self.logger.info("✍️\tFlow * -> CONTROLLER added to datapath: {}".format(dpid))
         self.__add_flow(datapath, 0, match, actions)
-        self.logger.info("🤝\thandshake taken place with datapath: {}".format(dpid_to_str(datapath.id)))
+        self.logger.info("🤝\tHandshake taken place with datapath: {}".format(dpid_to_str(datapath.id)))
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _port_status_handler(self, ev):
@@ -519,8 +518,11 @@ class Router(RyuApp):
         if not output_port:
             # self.logger.error("🚨\tno output port found")
             raise UnknownICMPError(f"Subnet unknown for ip: {IPAddress(dst_ip)}")
+        parser: ofproto_v1_3_parser = datapath.ofproto_parser
+        # # we have the routing_entry, so we know the destination network
+        # # dst_network = IPNetwork(routing_entry['destination'])
 
-        actions = [datapath.ofproto_parser.OFPActionOutput(output_port)]
+        actions = [parser.OFPActionOutput(output_port)]
 
         # mac address changes, otherwise next host won't care about it
         # for src_mac, we need to find the mac address on the same interfacea as this IPNetwork
@@ -562,9 +564,22 @@ class Router(RyuApp):
             p.add_protocol(protocol)
         p.serialize()
         self.logger.info(f"🎉\tForwarding to Output Port: {output_port}, {src_mac} -> {dst_mac} TTL: {p.get_protocol(ipv4).ttl}")
-        out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
                                                     in_port=in_port, actions=actions, data=p.data)
         datapath.send_msg(out)
+        match = parser.OFPMatch(
+            eth_type=0x0800,
+            ipv4_dst=dst_ip
+        )
+        self.logger.info(f"✍️\tInstalling flow * -> {dst_ip} to {output_port} on dp {dpid_to_str(datapath.id)}")
+        # create new packet out message
+        actions = [
+            # parser.OFPActionDecNwTtl(),  # Decrement the TTL
+            parser.OFPActionSetField(eth_dst=dst_mac),
+            parser.OFPActionSetField(eth_src=src_mac),
+            parser.OFPActionOutput(output_port, datapath.ofproto.OFPCML_NO_BUFFER)
+        ]
+        self.__add_flow(datapath, 100, match, actions, idle=60, hard=0)
         return
 
     def handle_arp(self, datapath, in_port, pkt: packet.Packet):
@@ -682,9 +697,9 @@ class Router(RyuApp):
             idle_timeout=idle,
             hard_timeout=hard,
         )
-        self.logger.info(
-            "✍️\tflow-Mod written to datapath: {}".format(dpid_to_str(datapath.id))
-        )
+        # self.logger.info(
+        #     "✍️\tflow-Mod written to datapath: {}".format(dpid_to_str(datapath.id))
+        # )
         datapath.send_msg(mod)
 
     def __illegal_packet(self, pkt, log=False):
