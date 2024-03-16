@@ -422,9 +422,8 @@ class Router(RyuApp):
 
         pkt_ethernet: ethernet = pkt.get_protocol(ethernet)
         pkt_ipv4: ipv4 = pkt.get_protocol(ipv4)
-        pkt_icmp: icmp = pkt.get_protocol(icmp)
 
-        if not pkt_ethernet or not pkt_ipv4 or not pkt_icmp:
+        if not pkt_ethernet or not pkt_ipv4:
             self.logger.error("🚨\tMissing protocol layer for ICMP reply")
             return
 
