@@ -247,29 +247,12 @@ class Router(RyuApp):
         if self.__illegal_packet(pkt):
             return
 
-        self.logger.info("❗️\tevent 'packet in' from datapath: {}".format(dpid_to_str(datapath.id)))
-
-        eth_pkt: ethernet = pkt.get_protocol(ethernet)
+        self.logger.info("-----------------------------------------------------------------------")
+        self.logger.info(f"📦\tPacket in: \t{self.print_packet(pkt)}, Datapath: {dpid_to_str(datapath.id)}, Port: {in_port}")
+        
         ip_pkt: ipv4 = pkt.get_protocol(ipv4)
         arp_pkt: arp = pkt.get_protocol(arp)
-        tcp_pkt: tcp = pkt.get_protocol(tcp)
-        udp_pkt: udp = pkt.get_protocol(udp)
         icmp_pkt: icmp = pkt.get_protocol(icmp)
-        self.logger.info("----- Packet Information Start -----")
-        if tcp_pkt:
-            if tcp_pkt.dst_port == 80 or tcp_pkt.dst_port == 443:
-                self.logger.info(f"HTTP/HTTPS 🌍 {ip_pkt.src}->{ip_pkt.dst}:{tcp_pkt.dst_port}")
-            else:
-                self.logger.info(f"TCP 🌐 {ip_pkt.src}->{ip_pkt.dst}:{tcp_pkt.dst_port}")
-        elif udp_pkt:
-            self.logger.info(f"UDP 🌐 {ip_pkt.src}->{ip_pkt.dst}:{udp_pkt.dst_port}")
-        elif icmp_pkt:
-            self.logger.info(f"ICMP 📡 type={icmp_pkt.type}, code={icmp_pkt.code}")
-        elif arp_pkt:
-            self.logger.info(f"ARP 🌍 {arp_pkt.src_ip}->{arp_pkt.dst_ip}")
-        elif ip_pkt:
-            self.logger.info(f"IP 🌐 {ip_pkt.src}->{ip_pkt.dst}")
-        
 
         if not self.packet_allowed_by_firewall(datapath, pkt):
             return
@@ -277,7 +260,7 @@ class Router(RyuApp):
             # self.logger.info(f"Ethernet: src={eth_pkt.src}, dst={eth_pkt.dst}, ethertype={eth_pkt.ethertype}")
         if arp_pkt:
             # self.logger.info(f"ARP: src_ip={arp_pkt.src_ip}, dst_ip={arp_pkt.dst_ip}, src_mac={arp_pkt.src_mac}, dst_mac={arp_pkt.dst_mac}")
-            self.handle_arp(datapath, in_port, eth_pkt, arp_pkt)
+            self.handle_arp(datapath, in_port, pkt)
             return
        # we check if ECHO and is for one of our ips, we respond
         if icmp_pkt:
@@ -292,20 +275,20 @@ class Router(RyuApp):
             try:
                 self.forward_packet(datapath, in_port, pkt, ev)
             except UnknownICMPError as e:
-                self.logger.error(f"Failed to forward packet: {e}")
+                self.logger.error(f"❌\tFailed to forward packet: {e}")
                 # 6 = unknown network
                 self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH, 6)
             # Note that there is no way for me to differentiate network unknown and network unreachable because I don't know the status of the routing entries
             except HostUnknown as e:
-                self.logger.error(f"Failed to forward packet: {e}")
+                self.logger.error(f"❌\tFailed to forward packet: {e}")
                 # 7 = host unknown
                 self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH,  7)
             # like an is_active field where the network exists, but is simply not reachable at the moment. We don't have this information here.
             except HostUnreachable as e:
-                self.logger.error(f"Failed to forward packet: {e}")
+                self.logger.error(f"❌\tFailed to forward packet: {e}")
                 self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH,  ICMP_HOST_UNREACH_CODE)
             except TTLExpired as e:
-                self.logger.error(f"Failed to forward packet: {e}")
+                self.logger.error(f"❌\tFailed to forward packet: {e}")
                 self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_TIME_EXCEEDED,  ICMP_TTL_EXPIRED_CODE)
             return
 
@@ -313,8 +296,57 @@ class Router(RyuApp):
             # self.logger.info(f"TCP: src_port={tcp_pkt.src_port}, dst_port={tcp_pkt.dst_port}, seq={tcp_pkt.seq}, ack={tcp_pkt.ack}")
         # if udp_pkt:
             # self.logger.info(f"UDP: src_port={udp_pkt.src_port}, dst_port={udp_pkt.dst_port}")
-        self.logger.info("----- Packet Information End -----")
         return
+
+    def print_packet(self, pkt):
+        eth_pkt: ethernet = pkt.get_protocol(ethernet)
+        ip_pkt: ipv4 = pkt.get_protocol(ipv4)
+        arp_pkt: arp = pkt.get_protocol(arp)
+        tcp_pkt: tcp = pkt.get_protocol(tcp)
+        udp_pkt: udp = pkt.get_protocol(udp)
+        icmp_pkt: icmp = pkt.get_protocol(icmp)
+        if tcp_pkt:
+            if tcp_pkt.dst_port == 80 or tcp_pkt.dst_port == 443:
+                return f"HTTP/HTTPS 🌍 {ip_pkt.src}->{ip_pkt.dst}:{tcp_pkt.dst_port}"
+            else:
+                return f"TCP 🌐 {ip_pkt.src}->{ip_pkt.dst}:{tcp_pkt.dst_port}"
+        elif udp_pkt:
+            if udp_pkt.dst_port == 53:
+                return f"DNS 🌍 {ip_pkt.src}->{ip_pkt.dst}:{udp_pkt.dst_port}"
+            elif udp_pkt.src_port == 53:
+                return f"DNS 🌍 {ip_pkt.src}:{udp_pkt.src_port}->{ip_pkt.dst}"
+            elif udp_pkt.dst_port == 67:
+                return f"DHCP 🌍 {ip_pkt.src}->{ip_pkt.dst}:{udp_pkt.dst_port}"
+            elif udp_pkt.src_port == 67:
+                return f"DHCP 🌍 {ip_pkt.src}:{udp_pkt.src_port}->{ip_pkt.dst}"
+            else:
+                return f"UDP 🌐 {ip_pkt.src}->{ip_pkt.dst}:{udp_pkt.dst_port}"
+        elif icmp_pkt:
+            if icmp_pkt.type == ICMP_ECHO_REQUEST:
+                return f"ICMP 📡 Echo Request {ip_pkt.src} -> {ip_pkt.dst}"
+            elif icmp_pkt.type == ICMP_ECHO_REPLY:
+                return f"ICMP 📡 Echo Reply {ip_pkt.src} -> {ip_pkt.dst}"
+            elif icmp_pkt.type == ICMP_DEST_UNREACH:
+                icmp_unreachable_messages = {
+                    0: "Network Unreachable",  # ICMP_NET_UNREACH_CODE
+                    1: "Host Unreachable",  # ICMP_HOST_UNREACH_CODE
+                    6: "Network Unknown",  # Custom Code for Network Unknown
+                    7: "Host Unknown",  # Custom Code for Host Unknown
+                }
+                message = icmp_unreachable_messages.get(icmp_pkt.code, f"Destination Unreachable: {icmp_pkt.code}")
+                return f"ICMP 📡 {message} {ip_pkt.src} -> {ip_pkt.dst}"
+            elif icmp_pkt.type == ICMP_TIME_EXCEEDED:
+                if icmp_pkt.code == ICMP_TTL_EXPIRED_CODE:
+                    return f"ICMP 📡 Time Exceeded: TTL Expired {ip_pkt.src} -> {ip_pkt.dst}"
+                else:
+                    return f"ICMP 📡 Time Exceeded: Code {icmp_pkt.code} {ip_pkt.src} -> {ip_pkt.dst}"
+            else:
+                return f"ICMP 📡 Type={icmp_pkt.type}, Code={icmp_pkt.code} {ip_pkt.src} -> {ip_pkt.dst}"
+        elif arp_pkt:
+            return f"ARP 🌍 {arp_pkt.src_ip} -> {arp_pkt.dst_ip}"
+        elif ip_pkt:
+            return f"IP 🌐 {ip_pkt.src}->{ip_pkt.dst}"
+        return eth_pkt,ip_pkt,arp_pkt,icmp_pkt
     
     def packet_allowed_by_firewall(self, dp, pkt: packet.Packet) -> None:
         """
@@ -367,14 +399,14 @@ class Router(RyuApp):
                     break
             if match_found:
                 if rule['allow']:
-                    self.logger.info(f"🔑✅ Packet matches rule {rule['description']} and is allowed")
+                    self.logger.info(f"🔑✅\tPacket matches rule :{rule['description']}: and is allowed")
                     return True
                 else:
-                    self.logger.info(f"🔒🚫 Packet matches rule {rule['description']} and is denied")
+                    self.logger.info(f"🔒🚫\tPacket matches rule :{rule['description']}: and is denied")
                     return False
-            else:
-                self.logger.info(f"🔍 Rule {rule['description']} - no match, checking next rule")
-        self.logger.info("🚫 No matching rule found, packet dropped")
+            # else:
+                # self.logger.info(f"🔍 Rule {rule['description']} - no match, checking next rule")
+        self.logger.info("🚫\tNo matching rule found, packet dropped")
         return False
 
     def send_icmp_unreachable_error(self, datapath, in_port, pkt, ev, type, code):
@@ -399,7 +431,7 @@ class Router(RyuApp):
             self.logger.error("🚨\tNo source IP found for interface during ICMP error message handling")
             return
         # we need to send an ICMP error message to the src ip and mac address
-        self.logger.info("🚨 Generating ICMP Error Message {}:{}".format(type, code))
+        self.logger.info("🚨\tGenerating ICMP Error Message {}:{}".format(type, code))
         eth_header_length = 14  # Ethernet header length
         original_ip_icmp_data = pkt.data[eth_header_length:eth_header_length+28]  # Skip Ethernet header, then IP header (20 bytes) + first 8 bytes of payload
 
@@ -440,8 +472,6 @@ class Router(RyuApp):
         if src_ip is None:
             src_ip = pkt_ipv4.dst
 
-        self.logger.info(f"Sending ICMP reply to {dst_ip}")
-
         # create new packet out message
         actions = [parser.OFPActionOutput(in_port)]
         out_pkt_ethernet = ethernet(dst=dst_mac, src=src_mac, ethertype=ETH_TYPE_IP)
@@ -453,7 +483,7 @@ class Router(RyuApp):
         out_pkt.add_protocol(out_pkt_icmp)
         out_pkt.serialize()
 
-        self.logger.info(f"✅ Sending ICMP reply from {src_ip} to {dst_ip}, MAC from {src_mac} to {dst_mac}")
+        self.logger.info(f"📡➡️🖥️\tSending ICMP reply {src_mac} -> {dst_mac}. Packet: {self.print_packet(out_pkt)}")
         # using OFPP_ANY or OFPP_CONTROLLER as the output port in order to bypass OpenFlow switch rules, just send it directly
         # otherwise the switch does not want to send it
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER, in_port=ofproto.OFPP_CONTROLLER, actions=actions, data=out_pkt.data);
@@ -487,7 +517,7 @@ class Router(RyuApp):
                 break;
 
         if not output_port:
-            self.logger.error("🚨\tno output port found")
+            # self.logger.error("🚨\tno output port found")
             raise UnknownICMPError(f"Subnet unknown for ip: {IPAddress(dst_ip)}")
 
         actions = [datapath.ofproto_parser.OFPActionOutput(output_port)]
@@ -531,17 +561,18 @@ class Router(RyuApp):
                 protocol.ttl -= 1
             p.add_protocol(protocol)
         p.serialize()
-        self.logger.info(f"✅ Output Port: {output_port}, {pkt_ipv4.src}:{pkt_ipv4.dst} {src_mac}:{dst_mac} TTL: {p.get_protocol(ipv4).ttl}")
+        self.logger.info(f"✅\tForwarding to Output Port: {output_port}, {src_mac} -> {dst_mac} TTL: {p.get_protocol(ipv4).ttl}")
         out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
                                                     in_port=in_port, actions=actions, data=p.data)
         datapath.send_msg(out)
         return
 
-    def handle_arp(self, datapath, in_port, pkt_ethernet: ethernet, pkt_arp: arp):
+    def handle_arp(self, datapath, in_port, pkt: packet.Packet):
         """
         Handle ARP packets
-        We need to find the entry in the interfaces.json that matches the in_port.
         """
+        pkt_ethernet: ethernet = pkt.get_protocol(ethernet)
+        pkt_arp: arp = pkt.get_protocol(arp)
         # Check if it's an ARP request
         if pkt_arp.opcode != ARP_REQUEST:
             return  # Only handle ARP requests
@@ -549,7 +580,7 @@ class Router(RyuApp):
         dpid = dpid_to_str(datapath.id)
         interface = self.interface_table.get_interface(dpid, in_port)
         if interface:
-            self.logger.info(f"Interface ARP Reply: {interface['hw']}")
+            self.logger.info("✅\tInterface ARP Reply: {}".format(interface['hw']))
         else:
             self.logger.error("🚨\tno interface found for in_port: {}".format(in_port))
         
