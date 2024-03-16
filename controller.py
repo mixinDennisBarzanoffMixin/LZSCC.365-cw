@@ -84,6 +84,13 @@ class HostUnknown(ICMPError):
     def __init__(self, message="ICMP Host Unknown Error occurred"):
         super().__init__(message)
 
+class TTLExpired(ICMPError):
+    """
+    Exception class for signaling ICMP TTL Expired errors.
+    """
+    def __init__(self, message="ICMP TTL Expired Error occurred"):
+        super().__init__(message)
+
 
 class Router(RyuApp):
 
@@ -297,6 +304,9 @@ class Router(RyuApp):
             except HostUnreachable as e:
                 self.logger.error(f"Failed to forward packet: {e}")
                 self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH,  ICMP_HOST_UNREACH_CODE)
+            except TTLExpired as e:
+                self.logger.error(f"Failed to forward packet: {e}")
+                self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_TIME_EXCEEDED,  ICMP_TTL_EXPIRED_CODE)
             return
 
         # if tcp_pkt:
@@ -455,6 +465,9 @@ class Router(RyuApp):
         """
         Forward the packet to the next hop
         """
+        pkt_ipv4 = pkt.get_protocol(ipv4)
+        if pkt_ipv4 and pkt_ipv4.ttl <= 1:
+            raise TTLExpired(f"TTL expired for packet from {pkt_ipv4.src} to {pkt_ipv4.dst}")
         pkt_ipv4: ipv4 = pkt.get_protocol(ipv4)
         if not pkt_ipv4:
             self.logger.error("🚨\tno ipv4 packet found")
@@ -513,11 +526,12 @@ class Router(RyuApp):
         # I was forgetting to add the other layers, it was confusing as h2 was receiving h1's pings, but not replying
         # and they were like 50% smaller packets, so I figured it was a good idea to add the other layers lol
         protocols = pkt.protocols
-        # self.logger.info(protocols)
         for protocol in protocols[1:]:
+            if isinstance(protocol, ipv4):
+                protocol.ttl -= 1
             p.add_protocol(protocol)
         p.serialize()
-        self.logger.info(f"✅ Output Port: {output_port}, {pkt_ipv4.src}:{pkt_ipv4.dst} {src_mac}:{dst_mac}")
+        self.logger.info(f"✅ Output Port: {output_port}, {pkt_ipv4.src}:{pkt_ipv4.dst} {src_mac}:{dst_mac} TTL: {p.get_protocol(ipv4).ttl}")
         out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
                                                     in_port=in_port, actions=actions, data=p.data)
         datapath.send_msg(out)
