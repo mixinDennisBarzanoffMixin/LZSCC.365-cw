@@ -66,14 +66,8 @@ class UnknownICMPError(ICMPError):
     """
     Extended ICMP Error for specific ICMP related issues, including unknown subnets.
     """
-    def __init__(self, message="Extended ICMP Error occurred", subnet=None):
+    def __init__(self, message="Extended ICMP Error occurred"):
         super().__init__(message)
-        self.subnet = subnet
-
-    def __str__(self):
-        if self.subnet:
-            return f"{self.message} Subnet: {self.subnet}"
-        return self.message
    
 
 class HostUnreachable(ICMPError):
@@ -395,7 +389,7 @@ class Router(RyuApp):
             self.logger.error("🚨\tNo source IP found for interface during ICMP error message handling")
             return
         # we need to send an ICMP error message to the src ip and mac address
-        self.logger.info("🚨 Generating ICMP error message for unknown subnet")
+        self.logger.info("🚨 Generating ICMP Error Message {}:{}".format(type, code))
         eth_header_length = 14  # Ethernet header length
         original_ip_icmp_data = pkt.data[eth_header_length:eth_header_length+28]  # Skip Ethernet header, then IP header (20 bytes) + first 8 bytes of payload
 
@@ -481,7 +475,7 @@ class Router(RyuApp):
 
         if not output_port:
             self.logger.error("🚨\tno output port found")
-            raise UnknownICMPError(f"Subnet unknown for ip: {IPAddress(dst_ip)}", subnet=routing_entry['destination'])
+            raise UnknownICMPError(f"Subnet unknown for ip: {IPAddress(dst_ip)}")
 
         actions = [datapath.ofproto_parser.OFPActionOutput(output_port)]
 
