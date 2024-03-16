@@ -533,15 +533,16 @@ class Router(RyuApp):
                 src_mac = interface_entry['hw']
                 break
         # now, dst_ip is not always accurate here, what if it's another router, we need to use next hop ip
+        next_hop_ip = dst_ip
         if routing_entry['hop']:
-            dst_ip = routing_entry['hop']
+            next_hop_ip = routing_entry['hop']
         for arp_entry in self.arp_table.get_table_for_dpid(dpid_to_str(datapath.id)):
-            if arp_entry['ip'] == dst_ip:
+            if arp_entry['ip'] == next_hop_ip:
                 dst_mac = arp_entry['hw']
                 break
         if not dst_mac:
-            self.logger.error("🚨\tno dst mac address found for ip: {}".format(IPAddress(dst_ip)))
-            raise HostUnreachable(f"No ARP entry for ip: {IPAddress(dst_ip)}")
+            self.logger.error("🚨\tno dst mac address found for ip: {}".format(IPAddress(next_hop_ip)))
+            raise HostUnreachable(f"No ARP entry for ip: {IPAddress(next_hop_ip)}")
         if not src_mac:
             self.logger.error("🚨\tno src mac address found for source interface: {}".format(routing_entry['destination']))
             return
@@ -567,6 +568,7 @@ class Router(RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
                                                     in_port=in_port, actions=actions, data=p.data)
         datapath.send_msg(out)
+        # i can't mask the whole network because I'd need to carefully check the firewall rules
         match = parser.OFPMatch(
             eth_type=0x0800,
             ipv4_dst=dst_ip
@@ -589,8 +591,7 @@ class Router(RyuApp):
         pkt_ethernet: ethernet = pkt.get_protocol(ethernet)
         pkt_arp: arp = pkt.get_protocol(arp)
         # Check if it's an ARP request
-        if pkt_arp.opcode != ARP_REQUEST:
-            return  # Only handle ARP requests
+        if pkt_arp.opcode != ARP_REQUEST: return  # Only handle ARP requests
 
         dpid = dpid_to_str(datapath.id)
         interface = self.interface_table.get_interface(dpid, in_port)
@@ -637,6 +638,7 @@ class Router(RyuApp):
                                                 data=p.data)
         datapath.send_msg(out)
         self.logger.info(f"🎉\tSent ARP Reply: {pkt_arp.dst_ip} is at {src_mac}, which is actually {src_ip}, but we proxy directly and pretend it's our interface that's the host")
+
 
 
     # def forward_broadcast(self, datapath, in_port, data):
