@@ -561,7 +561,7 @@ class Router(RyuApp):
                 protocol.ttl -= 1
             p.add_protocol(protocol)
         p.serialize()
-        self.logger.info(f"✅\tForwarding to Output Port: {output_port}, {src_mac} -> {dst_mac} TTL: {p.get_protocol(ipv4).ttl}")
+        self.logger.info(f"🎉\tForwarding to Output Port: {output_port}, {src_mac} -> {dst_mac} TTL: {p.get_protocol(ipv4).ttl}")
         out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
                                                     in_port=in_port, actions=actions, data=p.data)
         datapath.send_msg(out)
@@ -621,7 +621,7 @@ class Router(RyuApp):
                                                 actions=actions,
                                                 data=p.data)
         datapath.send_msg(out)
-        self.logger.info(f"✅ Sent ARP Reply: {pkt_arp.dst_ip} is at {src_mac}, which is actually {src_ip}, but we proxy directly and pretend it's our interface that's the host")
+        self.logger.info(f"🎉\tSent ARP Reply: {pkt_arp.dst_ip} is at {src_mac}, which is actually {src_ip}, but we proxy directly and pretend it's our interface that's the host")
 
 
     # def forward_broadcast(self, datapath, in_port, data):
