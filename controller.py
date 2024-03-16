@@ -12,6 +12,8 @@ used for static data management.
 Note: Requires Python3.8 or higher (uses the ':=' operator)
 """
 
+from abc import abstractmethod
+from typing import Dict, List
 from typing import Optional, Tuple, Union
 from netaddr import IPAddress, IPNetwork
 
@@ -21,6 +23,7 @@ from ryu.controller.handler import (
     HANDSHAKE_DISPATCHER,
     CONFIG_DISPATCHER,
     MAIN_DISPATCHER,
+    DEAD_DISPATCHER,
     set_ev_cls,
 )
 from ryu.ofproto import ofproto_v1_3
@@ -71,7 +74,21 @@ class UnknownICMPError(ICMPError):
         if self.subnet:
             return f"{self.message} Subnet: {self.subnet}"
         return self.message
+   
 
+class HostUnreachable(ICMPError):
+    """
+    Exception class for signaling ICMP Host Unreachable errors.
+    """
+    def __init__(self, message="ICMP Host Unreachable Error occurred"):
+        super().__init__(message)
+
+class HostUnknown(ICMPError):
+    """
+    Exception class for signaling ICMP Host Unknown errors.
+    """
+    def __init__(self, message="ICMP Host Unknown Error occurred"):
+        super().__init__(message)
 
 
 class Router(RyuApp):
@@ -82,6 +99,22 @@ class Router(RyuApp):
     # This is not for any particular technical reason other than the fact they
     # can make your controller harder to debug.
     ILLEGAL_PROTOCOLS = [ipv6, lldp]
+
+    # used for icmp host unreachable tracking link up and down status
+    # use mininet>link h2 r1 up/down to simulate host being disconnected from the network
+    # 
+    # Example of host reachability map structure:
+    # {
+    #     "0000000000000002": {
+    #         "00:aa:aa:aa:aa:aa": True,
+    #         "00:aa:aa:aa:aa:bb": False
+    #     },
+    #     "0000000000000003": {
+    #         "00:cc:cc:cc:cc:aa": True,
+    #         "00:dd:dd:dd:dd:bb": True
+    #     }
+    # }
+    host_reachability_map: Dict[str, Dict[str, bool]] = {}
 
     def __init__(self, *args, **kwargs):
         """
@@ -95,6 +128,11 @@ class Router(RyuApp):
             self.routing_table = StaticRoutingTable()
             self.interface_table = StaticInterfaceTable()
             self.firewall_rules = FirewallRules()
+            # Initialize host reachability to all true for every ARP entry
+            for dpid, arp_entries in self.arp_table.get_table().items():
+                self.host_reachability_map[dpid] = {entry['hw']: True for entry in arp_entries}
+            self.logger.info(f"Host reachability map: {self.host_reachability_map}")
+
             # self.handle_ethernet = HandleEthernet(self.logger)
         except Exception as e:
             self.logger.error("🆘\t{}".format(e))
@@ -145,6 +183,42 @@ class Router(RyuApp):
         self.__add_flow(datapath, 0, match, actions)
         self.logger.info("🤝\thandshake taken place with datapath: {}".format(dpid_to_str(datapath.id)))
 
+    @set_ev_cls(ofp_event.EventOFPPortStatus, [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def _port_status_handler(self, ev):
+        msg = ev.msg
+        dp = msg.datapath
+        ofp = dp.ofproto
+
+        if msg.reason == ofp.OFPPR_ADD:
+            self.logger.info("Port added: %s", msg.desc.port_no)
+        elif msg.reason == ofp.OFPPR_DELETE:
+            self.logger.info("Port deleted: %s", msg.desc.port_no)
+            # A port was deleted, indicating a host may have been disconnected
+            # Update your host reachability state here
+        elif msg.reason == ofp.OFPPR_MODIFY:
+            self.logger.info("Port modified: %s", msg.desc.port_no)
+            # update reachability status for what was connected to the port
+            # A port was modified, this could indicate a link status change
+            # Check msg.desc.state and update your host reachability state accordingly
+            for routing_entry in self.routing_table.get_table().get(dpid_to_str(dp.id), []):
+                # self.logger.info("Checking routing entry: %s", routing_entry)
+                if routing_entry['out_port'] == msg.desc.port_no:
+                    # self.logger.info("Matching port found in routing entry: %s", routing_entry)
+                    if '/32' in routing_entry['destination']:
+                        ip_address = str(IPNetwork(routing_entry['destination']).ip)
+                        # self.logger.info("IP address extracted from routing entry: %s", ip_address)
+                        for arp_entry in self.arp_table.get_table_for_dpid(dpid_to_str(dp.id)):
+                            # self.logger.info("Checking ARP entry: %s", arp_entry)
+                            if arp_entry['ip'] == ip_address:
+                                mac_address = arp_entry['hw']
+                                # self.logger.info("Matching ARP entry found: %s", arp_entry)
+                                # this is kind of weird because the link being down can be either our fault or the other host's fault
+                                # but we assume the other host is at fault because our routers are of countain perfect
+                                self.host_reachability_map[dpid_to_str(dp.id)][mac_address] = msg.desc.state & ofp.OFPPS_LIVE
+                                self.logger.info("Reachability updated for MAC: %s, State: %s", mac_address, msg.desc.state == ofp.OFPPS_LIVE)
+                                break
+
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev: ofp_event.EventOFPPacketIn) -> None:
         """
@@ -166,9 +240,6 @@ class Router(RyuApp):
         https://ryu.readthedocs.io/en/latest/ofproto_v1_3_ref.html#ryu.ofproto.ofproto_v1_3_parser.OFPPacketOut
         """
         datapath = ev.msg.datapath
-        dpid = dpid_to_str(datapath.id)
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
         pkt = packet.Packet(ev.msg.data)
         in_port = ev.msg.match["in_port"]
 
@@ -183,39 +254,126 @@ class Router(RyuApp):
         tcp_pkt: tcp = pkt.get_protocol(tcp)
         udp_pkt: udp = pkt.get_protocol(udp)
         icmp_pkt: icmp = pkt.get_protocol(icmp)
-
         self.logger.info("----- Packet Information Start -----")
-        if eth_pkt:
-            self.logger.info(f"Ethernet: src={eth_pkt.src}, dst={eth_pkt.dst}, ethertype={eth_pkt.ethertype}")
+        if tcp_pkt:
+            if tcp_pkt.dst_port == 80 or tcp_pkt.dst_port == 443:
+                self.logger.info(f"HTTP/HTTPS 🌍 {ip_pkt.src}->{ip_pkt.dst}:{tcp_pkt.dst_port}")
+            else:
+                self.logger.info(f"TCP 🌐 {ip_pkt.src}->{ip_pkt.dst}:{tcp_pkt.dst_port}")
+        elif udp_pkt:
+            self.logger.info(f"UDP 🌐 {ip_pkt.src}->{ip_pkt.dst}:{udp_pkt.dst_port}")
+        elif icmp_pkt:
+            self.logger.info(f"ICMP 📡 type={icmp_pkt.type}, code={icmp_pkt.code}")
+        elif arp_pkt:
+            self.logger.info(f"ARP 🌍 {arp_pkt.src_ip}->{arp_pkt.dst_ip}")
+        elif ip_pkt:
+            self.logger.info(f"IP 🌐 {ip_pkt.src}->{ip_pkt.dst}")
+        
+
+        if not self.packet_allowed_by_firewall(datapath, pkt):
+            return
+        # if eth_pkt:
+            # self.logger.info(f"Ethernet: src={eth_pkt.src}, dst={eth_pkt.dst}, ethertype={eth_pkt.ethertype}")
         if arp_pkt:
-            self.logger.info(f"ARP: src_ip={arp_pkt.src_ip}, dst_ip={arp_pkt.dst_ip}, src_mac={arp_pkt.src_mac}, dst_mac={arp_pkt.dst_mac}")
+            # self.logger.info(f"ARP: src_ip={arp_pkt.src_ip}, dst_ip={arp_pkt.dst_ip}, src_mac={arp_pkt.src_mac}, dst_mac={arp_pkt.dst_mac}")
             self.handle_arp(datapath, in_port, eth_pkt, arp_pkt)
             return
        # we check if ECHO and is for one of our ips, we respond
         if icmp_pkt:
-            self.logger.info(f"ICMP: type={icmp_pkt.type}, code={icmp_pkt.code}")
+            # self.logger.info(f"ICMP: type={icmp_pkt.type}, code={icmp_pkt.code}")
             if icmp_pkt.type == ICMP_ECHO_REQUEST:
                 for interface in self.interface_table.get_table_for_dpid(dpid_to_str(datapath.id)):
                      if interface['ip'] == ip_pkt.dst:
                         self.send_icmp_reply(datapath, in_port, pkt, ev)
                         return
         if ip_pkt:
-            self.logger.info(f"IPv4: src={ip_pkt.src}, dst={ip_pkt.dst}, proto={ip_pkt.proto}")
+            # self.logger.info(f"IPv4: src={ip_pkt.src}, dst={ip_pkt.dst}, proto={ip_pkt.proto}")
             try:
                 self.forward_packet(datapath, in_port, pkt, ev)
             except UnknownICMPError as e:
                 self.logger.error(f"Failed to forward packet: {e}")
-                self.send_icmp_unknown_subnet_error(datapath, in_port, pkt, ev)
+                # 6 = unknown network
+                self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH, 6)
+            # Note that there is no way for me to differentiate network unknown and network unreachable because I don't know the status of the routing entries
+            except HostUnknown as e:
+                self.logger.error(f"Failed to forward packet: {e}")
+                # 7 = host unknown
+                self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH,  7)
+            # like an is_active field where the network exists, but is simply not reachable at the moment. We don't have this information here.
+            except HostUnreachable as e:
+                self.logger.error(f"Failed to forward packet: {e}")
+                self.send_icmp_unreachable_error(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH,  ICMP_HOST_UNREACH_CODE)
             return
 
-        if tcp_pkt:
-            self.logger.info(f"TCP: src_port={tcp_pkt.src_port}, dst_port={tcp_pkt.dst_port}, seq={tcp_pkt.seq}, ack={tcp_pkt.ack}")
-        if udp_pkt:
-            self.logger.info(f"UDP: src_port={udp_pkt.src_port}, dst_port={udp_pkt.dst_port}")
+        # if tcp_pkt:
+            # self.logger.info(f"TCP: src_port={tcp_pkt.src_port}, dst_port={tcp_pkt.dst_port}, seq={tcp_pkt.seq}, ack={tcp_pkt.ack}")
+        # if udp_pkt:
+            # self.logger.info(f"UDP: src_port={udp_pkt.src_port}, dst_port={udp_pkt.dst_port}")
         self.logger.info("----- Packet Information End -----")
-
         return
-    def send_icmp_unknown_subnet_error(self, datapath, in_port, pkt, ev):
+    
+    def packet_allowed_by_firewall(self, dp, pkt: packet.Packet) -> None:
+        """
+        Check if the packet is allowed by the firewall
+        """
+        rules_table = self.firewall_rules.get_table_for_dpid(dpid_to_str(dp.id))
+        sort_by_priority = sorted(rules_table, key=lambda rule: rule['priority'], reverse=True)
+        for rule in sort_by_priority:
+            match_found = True
+            for key, value in rule['match'].items():
+                # self.logger.info(f"Checking match for key: {key} with value: {value}")
+                if key == "ip_proto":
+                    ip_proto = pkt.get_protocol(ipv4).proto if pkt.get_protocols(ipv4) else None
+                    # self.logger.info(f"ip_proto: {ip_proto}, expected: {int(value, 16)}")
+                    if ip_proto != int(value, 16):
+                        match_found = False
+                        # self.logger.info("ip_proto match failed")
+                        break
+                elif key == "ip_dst":
+                    ip_dst = pkt.get_protocol(ipv4).dst if pkt.get_protocols(ipv4) else None
+                    # self.logger.info(f"ip_dst: {ip_dst}, expected: {value}")
+                    if ip_dst != value:
+                        match_found = False
+                        # self.logger.info("ip_dst match failed")
+                        break
+                elif key == "tcp_dst":
+                    tcp_dst = pkt.get_protocol(tcp).dst_port if pkt.get_protocols(tcp) else None
+                    # self.logger.info(f"tcp_dst: {tcp_dst}, expected: {int(value)}")
+                    if tcp_dst != int(value):
+                        match_found = False
+                        # self.logger.info("tcp_dst match failed")
+                        break
+                elif key == "udp_dst":
+                    udp_dst = pkt.get_protocol(udp).dst_port if pkt.get_protocols(udp) else None
+                    # self.logger.info(f"udp_dst: {udp_dst}, expected: {int(value)}")
+                    if udp_dst != int(value):
+                        match_found = False
+                        # self.logger.info("udp_dst match failed")
+                        break
+                elif key == "eth_type":
+                    eth_type = pkt.get_protocol(ethernet).ethertype if pkt.get_protocols(ethernet) else None
+                    # self.logger.info(f"eth_type: {eth_type}, expected: {int(value, 16)}")
+                    if eth_type != int(value, 16):
+                        match_found = False
+                        # self.logger.info("eth_type match failed")
+                        break
+                else:
+                    match_found = False
+                    # self.logger.info("No matching key found")
+                    break
+            if match_found:
+                if rule['allow']:
+                    self.logger.info(f"🔑✅ Packet matches rule {rule['description']} and is allowed")
+                    return True
+                else:
+                    self.logger.info(f"🔒🚫 Packet matches rule {rule['description']} and is denied")
+                    return False
+            else:
+                self.logger.info(f"🔍 Rule {rule['description']} - no match, checking next rule")
+        self.logger.info("🚫 No matching rule found, packet dropped")
+        return False
+
+    def send_icmp_unreachable_error(self, datapath, in_port, pkt, ev, type, code):
         """
         Generate and send an ICMP error message for packets destined to unknown subnets.
         """
@@ -243,8 +401,8 @@ class Router(RyuApp):
 
         original_pkt_data = dest_unreach(data=original_ip_icmp_data)
         
-        self.send_icmp_reply_general(datapath, in_port, pkt, ev, ICMP_DEST_UNREACH, ICMP_HOST_UNREACH_CODE, src_ip, original_pkt_data)
-    
+        self.send_icmp_reply_general(datapath, in_port, pkt, ev, type, code, src_ip, original_pkt_data)
+
 
     def send_icmp_reply(self, datapath, in_port, pkt, ev):
         """
@@ -314,20 +472,17 @@ class Router(RyuApp):
             return
         # find the entry from the routing table
         routing_table = self.routing_table.get_table_for_dpid(dpid_to_str(datapath.id))
-        self.logger.info(f"Routing Table: {routing_table}")
         dst_ip = pkt_ipv4.dst
         output_port = None
         for routing_entry in routing_table:
-            self.logger.info(f"Routing Table Entry: {routing_entry}")
             if IPAddress(dst_ip) in IPNetwork(routing_entry['destination']):
                 output_port = routing_entry['out_port']
-                self.logger.info(f"✅ Output Port: {output_port}")
+                # self.logger.info(f"✅ Output Port: {output_port}")
                 break;
 
         if not output_port:
             self.logger.error("🚨\tno output port found")
             raise UnknownICMPError(f"Subnet unknown for ip: {IPAddress(dst_ip)}", subnet=routing_entry['destination'])
-            return
 
         actions = [datapath.ofproto_parser.OFPActionOutput(output_port)]
 
@@ -348,11 +503,15 @@ class Router(RyuApp):
                 break
         if not dst_mac:
             self.logger.error("🚨\tno dst mac address found for ip: {}".format(IPAddress(dst_ip)))
-            raise UnknownICMPError(f"No ARP entry for ip: {IPAddress(dst_ip)}", subnet=routing_entry['destination'])
-            return
+            raise HostUnreachable(f"No ARP entry for ip: {IPAddress(dst_ip)}")
         if not src_mac:
             self.logger.error("🚨\tno src mac address found for source interface: {}".format(routing_entry['destination']))
             return
+        
+        reachability_map = self.host_reachability_map[dpid_to_str(datapath.id)]
+        if (reachability_map[dst_mac] == False):
+            self.logger.error("🚨\tHost is unreachable")
+            raise HostUnreachable(f"Host is unreachable")
     
         e = ethernet(dst=dst_mac, src=src_mac, ethertype=pkt_ethernet.ethertype)
         p = packet.Packet()
@@ -361,12 +520,11 @@ class Router(RyuApp):
         # I was forgetting to add the other layers, it was confusing as h2 was receiving h1's pings, but not replying
         # and they were like 50% smaller packets, so I figured it was a good idea to add the other layers lol
         protocols = pkt.protocols
-        self.logger.info(protocols)
+        # self.logger.info(protocols)
         for protocol in protocols[1:]:
             p.add_protocol(protocol)
         p.serialize()
-        self.logger.info(f"✅ Output Ethernet Frame Source MAC: {src_mac}, Destination MAC: {dst_mac}")
-        self.logger.info(f"✅ Output IP Frame Source IP: {pkt_ipv4.src}, Destination IP: {pkt_ipv4.dst}")
+        self.logger.info(f"✅ Output Port: {output_port}, {pkt_ipv4.src}:{pkt_ipv4.dst} {src_mac}:{dst_mac}")
         out = datapath.ofproto_parser.OFPPacketOut(datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
                                                     in_port=in_port, actions=actions, data=p.data)
         datapath.send_msg(out)
@@ -425,7 +583,7 @@ class Router(RyuApp):
                                                 actions=actions,
                                                 data=p.data)
         datapath.send_msg(out)
-        self.logger.info(f"Sent ARP Reply: {pkt_arp.dst_ip} is at {src_mac}, which is actually {src_ip}, but we proxy direclty and lie it's our interface that's the host")
+        self.logger.info(f"✅ Sent ARP Reply: {pkt_arp.dst_ip} is at {src_mac}, which is actually {src_ip}, but we proxy directly and pretend it's our interface that's the host")
 
 
     # def forward_broadcast(self, datapath, in_port, data):
