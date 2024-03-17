@@ -569,16 +569,31 @@ class Router(RyuApp):
                                                     in_port=in_port, actions=actions, data=p.data)
         datapath.send_msg(out)
         # i can't mask the whole network because I'd need to carefully check the firewall rules
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_dst=dst_ip
-        )
+        if pkt.get_protocol(icmp):
+            match = parser.OFPMatch(
+                eth_type=0x0800,
+                ipv4_dst=dst_ip,
+                ip_proto=inet.IPPROTO_ICMP
+            )
+        elif pkt.get_protocol(tcp):
+            tcp_pkt = pkt.get_protocol(tcp)
+            match = parser.OFPMatch(
+                eth_type=0x0800,
+                ipv4_dst=dst_ip,
+                ip_proto=inet.IPPROTO_TCP,
+                tcp_dst=tcp_pkt.dst_port
+            )
+        else:
+            match = parser.OFPMatch(
+                eth_type=0x0800,
+                ipv4_dst=dst_ip
+            )
         self.logger.info(f"✍️\tInstalling flow * -> {dst_ip} to {output_port} on dp {dpid_to_str(datapath.id)}")
         # create new packet out message
         actions = [
-            # parser.OFPActionDecNwTtl(),  # Decrement the TTL
             parser.OFPActionSetField(eth_dst=dst_mac),
             parser.OFPActionSetField(eth_src=src_mac),
+            parser.OFPActionDecNwTtl(),  # Decrement the TTL
             parser.OFPActionOutput(output_port, datapath.ofproto.OFPCML_NO_BUFFER)
         ]
         self.__add_flow(datapath, 100, match, actions, idle=60, hard=0)
